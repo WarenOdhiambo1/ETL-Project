@@ -1,112 +1,116 @@
-# Two fixes applied:
-#   1. Install pyarrow first: pip install pyarrow
-#   2. yfinance now returns multi-level columns — flatten them
-#      BEFORE calling pl.from_pandas()
-# ═══════════════════════════════════════════════════════
+# Professional parallel extraction — all tickers fetched simultaneously
+# Sequential: 6 tickers × 3s each = 18s
+# Parallel:   6 tickers at once   = ~3s   (6x faster immediately)
+# 
+# Professional parallel extraction — all tickers fetched simultaneously
+# Sequential: 6 tickers × 3s each = 18s
+# Parallel:   6 tickers at once   = ~3s   (6x faster immediately)
+# ═══════════════════════════════════════════════════════════════════
+ 
 import yfinance as yf
 import polars as pl
 import pandas as pd
 import logging
-
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+ 
 logger = logging.getLogger(__name__)
-
-
+ 
+MAX_RETRIES  = 3
+WAIT_SECONDS = 5
+MAX_WORKERS  = 6   # one thread per ticker — safe for Yahoo Finance rate limits
+ 
+ 
 def _flatten_columns(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Robustly flatten yfinance column names after reset_index().
-
-    The problem:
-      yfinance returns columns as a MultiIndex: [("Open","BTC-USD"), ...]
-      After reset_index(), the date index is injected as a plain string "Datetime"
-      while the OHLCV columns remain tuples.
-      The result is a MIXED index — not a pure MultiIndex, not pure strings.
-
-      isinstance(raw.columns, pd.MultiIndex) → False  (mixed, not pure)
-      str(("Open","BTC-USD"))               → "('open', 'btc-usd')"  (wrong)
-
-    The fix:
-      Iterate every column individually.
-      If it is a tuple  → take the first element (the field name).
-      If it is a string → keep it as-is.
-      Then lowercase everything.
-
-    This handles all four cases yfinance produces:
-      "Datetime"           → "datetime"
-      ("Open",  "BTC-USD") → "open"
-      ("Open",  "")        → "open"
-      "open"               → "open"   (already clean)
+    Flatten yfinance mixed column types after reset_index().
+    Handles: plain strings, tuples, MultiIndex — all cases.
     """
     flat = []
     for col in df.columns:
-        if isinstance(col, tuple):
-            name = str(col[0])
-        else:
-            name = str(col)
+        name = str(col[0]) if isinstance(col, tuple) else str(col)
         flat.append(name.lower().strip().replace(" ", "_"))
     df.columns = flat
     return df
-
-
-def extract(
-    ticker: str,
-    period: str = "20y",
-    interval: str = "1d"
-) -> pl.DataFrame:
+ 
+ 
+def extract(ticker: str, period: str = "20y", interval: str = "1d") -> pl.DataFrame:
     """
-    Download OHLCV data from Yahoo Finance.
-    Returns a clean Polars DataFrame ready for transform().
-
-    Args:
-        ticker:   e.g. "BTC-USD", "AAPL", "SPY"
-        period:   "20y" for daily/weekly, "700d" for hourly (Yahoo limit)
-        interval: "1d", "1wk", "1h"
+    Download one ticker with automatic retry on timeout or empty response.
+    Used directly and also called inside the parallel executor.
     """
-    logger.info(f"Extracting {ticker} | period={period} | interval={interval}")
-
-    raw: pd.DataFrame = yf.download(
-        ticker,
-        period=period,
-        interval=interval,
-        auto_adjust=True,
-        progress=False,
-        threads=False,
-    )
-
-    if raw.empty:
-        raise ValueError(
-            f"No data returned for {ticker}. "
-            f"period={period}, interval={interval}."
-        )
-
-    # Bring date/datetime index into a regular column
-    raw = raw.reset_index()
-
-    # Flatten columns — handles mixed string/tuple columns from yfinance
-    raw = _flatten_columns(raw)
-
-    # At this point all column names are clean lowercase strings:
-    #   daily/weekly: "date", "open", "high", "low", "close", "volume"
-    #   hourly:       "datetime", "open", "high", "low", "close", "volume"
-    # The transform() step handles the datetime→date rename.
-
-    logger.info(f"Columns after flatten: {raw.columns.tolist()}")
-
-    df = pl.from_pandas(raw)
-
-    logger.info(f"Extracted {len(df)} rows for {ticker}")
-    return df
-
-
-def extract_multiple(
-    tickers: list[str],
-    period: str = "20y",
-    interval: str = "1d"
-) -> dict[str, pl.DataFrame]:
-    """Extract multiple tickers. Returns {ticker: DataFrame}."""
-    results = {}
-    for ticker in tickers:
+    last_error = None
+ 
+    for attempt in range(1, MAX_RETRIES + 1):
         try:
-            results[ticker] = extract(ticker, period=period, interval=interval)
+            raw: pd.DataFrame = yf.download(
+                ticker,
+                period=period,
+                interval=interval,
+                auto_adjust=True,
+                progress=False,
+                threads=False,
+                timeout=30,
+            )
+ 
+            if not raw.empty:
+                raw = raw.reset_index()
+                raw = _flatten_columns(raw)
+                df  = pl.from_pandas(raw)
+                logger.info(f"[{ticker}/{interval}] {len(df)} rows extracted")
+                return df
+ 
+            logger.warning(f"[{ticker}/{interval}] Empty response attempt {attempt}/{MAX_RETRIES}")
+ 
         except Exception as e:
-            logger.error(f"Failed {ticker}: {e}")
+            last_error = e
+            logger.warning(f"[{ticker}/{interval}] Attempt {attempt} failed: {e}")
+ 
+        if attempt < MAX_RETRIES:
+            time.sleep(WAIT_SECONDS)
+ 
+    raise ValueError(
+        f"[{ticker}/{interval}] Failed after {MAX_RETRIES} attempts. "
+        f"Last error: {last_error}"
+    )
+ 
+ 
+def extract_parallel(
+    tickers: list[str],
+    period:  str = "20y",
+    interval: str = "1d",
+) -> dict[str, pl.DataFrame]:
+    """
+    Fetch all tickers simultaneously using a thread pool.
+ 
+    Sequential (old):  ticker1 → ticker2 → ticker3 → ...  ~18 seconds
+    Parallel   (new):  all tickers at once               ~3 seconds
+ 
+    ThreadPoolExecutor is safe here because each thread makes its own
+    HTTP request to Yahoo Finance — no shared mutable state.
+    """
+    results  = {}
+    failures = {}
+ 
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        # Submit all download jobs at once
+        future_to_ticker = {
+            executor.submit(extract, ticker, period, interval): ticker
+            for ticker in tickers
+        }
+ 
+        # Collect results as they complete (fastest first)
+        for future in as_completed(future_to_ticker):
+            ticker = future_to_ticker[future]
+            try:
+                results[ticker] = future.result()
+            except Exception as e:
+                failures[ticker] = str(e)
+                logger.error(f"[{ticker}/{interval}] Extract failed: {e}")
+ 
+    if failures:
+        logger.warning(f"Failed tickers: {list(failures.keys())}")
+ 
     return results
+ 
+ 

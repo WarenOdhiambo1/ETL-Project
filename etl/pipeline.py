@@ -1,39 +1,54 @@
-# ═══════════════════════════════════════════════════════
+
 # FILE 3 — etl/pipeline.py  (replace your existing pipeline.py)
-# ═══════════════════════════════════════════════════════
+
 #
 # Fix: read per-timeframe period from TIMEFRAMES config
 #      instead of using one global HISTORY_PERIOD for all intervals
-# ═══════════════════════════════════════════════════════
+
  
-from etl.extract import extract
+# Parallel pipeline — all tickers extracted simultaneously per timeframe
+
+ 
+from etl.extract   import extract_parallel
 from etl.transform import transform
-from etl.load import load
-from config import TICKERS, TIMEFRAMES, TABLE_PREFIX
+from etl.load      import load
+from config        import TICKERS, TIMEFRAMES, TABLE_PREFIX
 import logging
+import time
  
 logger = logging.getLogger(__name__)
  
  
-def run_full_pipeline():
+def run_full_pipeline() -> dict:
     """
-    Run the complete ETL for all tickers and all timeframes.
+    Full ETL — parallel extraction, sequential transform + load.
  
-    Each timeframe now uses its own correct period:
-      1d  → 20y
-      1wk → 20y
-      1h  → 700d  (Yahoo Finance limits hourly to 730 days)
+    Architecture:
+      EXTRACT:   all tickers fetched simultaneously (6x faster)
+      TRANSFORM: CPU-bound Polars operations — fast enough sequentially
+      LOAD:      Supabase upsert — sequential to avoid connection pool limits
+ 
+    Returns summary dict with row counts and failure list.
     """
     total_rows = 0
     failures   = []
+    start_time = time.time()
  
-    for ticker in TICKERS:
-        for key, (interval, period, suffix) in TIMEFRAMES.items():
-            table = f"{TABLE_PREFIX}_{suffix}"   # e.g. "ohlcv_daily"
+    for key, (interval, period, suffix) in TIMEFRAMES.items():
+        table = f"{TABLE_PREFIX}_{suffix}"
+        logger.info(f"\n── {interval} ({period}) → {table} ──────────────────")
+ 
+        # ── EXTRACT: all tickers in parallel ──────────────────────
+        raw_data = extract_parallel(TICKERS, period=period, interval=interval)
+ 
+        # ── TRANSFORM + LOAD: sequential per ticker ───────────────
+        for ticker in TICKERS:
+            if ticker not in raw_data:
+                failures.append(f"{ticker}/{interval}: extraction failed")
+                continue
  
             try:
-                raw_df      = extract(ticker, period=period, interval=interval)
-                clean_df    = transform(raw_df, ticker)
+                clean_df    = transform(raw_data[ticker], ticker)
                 rows_loaded = load(clean_df, table)
                 total_rows += rows_loaded
                 logger.info(f"✓ {ticker}/{interval} → {rows_loaded} rows → {table}")
@@ -42,32 +57,47 @@ def run_full_pipeline():
                 msg = f"{ticker}/{interval}: {e}"
                 failures.append(msg)
                 logger.error(f"✗ {msg}")
-                continue   # one failure doesn't stop the rest
  
-    # Summary
-    logger.info(f"\nPipeline complete.")
-    logger.info(f"  Total rows loaded: {total_rows}")
+    elapsed = time.time() - start_time
+ 
+    # ── Summary ───────────────────────────────────────────────────
+    logger.info(f"\n{'═'*50}")
+    logger.info(f"Pipeline complete in {elapsed:.1f}s")
+    logger.info(f"Total rows loaded: {total_rows:,}")
     if failures:
-        logger.warning(f"  Failures ({len(failures)}):")
+        logger.warning(f"Failures ({len(failures)}):")
         for f in failures:
-            logger.warning(f"    - {f}")
+            logger.warning(f"  - {f}")
+    else:
+        logger.info("All tickers loaded successfully ✓")
+    logger.info(f"{'═'*50}")
+ 
+    return {"rows": total_rows, "failures": failures, "elapsed_seconds": round(elapsed, 1)}
+ 
+ 
+def run_daily_update() -> dict:
+    """
+    Lightweight daily refresh — last 5 days only.
+    Called by Airflow DAG every morning at 02:00 UTC.
+    """
+    total_rows = 0
+    failures   = []
+ 
+    for key, (interval, _, suffix) in TIMEFRAMES.items():
+        table = f"{TABLE_PREFIX}_{suffix}"
+        raw_data = extract_parallel(TICKERS, period="5d", interval=interval)
+ 
+        for ticker in TICKERS:
+            if ticker not in raw_data:
+                failures.append(f"{ticker}/{interval}")
+                continue
+            try:
+                clean_df    = transform(raw_data[ticker], ticker)
+                rows_loaded = load(clean_df, table)
+                total_rows += rows_loaded
+            except Exception as e:
+                failures.append(f"{ticker}/{interval}: {e}")
  
     return {"rows": total_rows, "failures": failures}
  
  
-def run_daily_update():
-    """Lightweight daily refresh — recent data only."""
-    total_rows = 0
-    for ticker in TICKERS:
-        for key, (interval, _, suffix) in TIMEFRAMES.items():
-            # For daily updates, pull only 5 days regardless of timeframe
-            update_period = "5d" if interval != "1h" else "5d"
-            table = f"{TABLE_PREFIX}_{suffix}"
-            try:
-                raw_df      = extract(ticker, period=update_period, interval=interval)
-                clean_df    = transform(raw_df, ticker)
-                rows_loaded = load(clean_df, table)
-                total_rows += rows_loaded
-            except Exception as e:
-                logger.error(f"Daily update failed {ticker}/{interval}: {e}")
-    return total_rows
